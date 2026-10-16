@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
         webView = WebView(this)
         webView.setBackgroundColor(android.graphics.Color.TRANSPARENT)
         setContentView(webView)
-        
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -159,8 +159,51 @@ class MainActivity : AppCompatActivity() {
         // 备份导出等下载：交给系统下载管理器，落到公共下载目录
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
-                if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
+                if (url.startsWith("data:")) {
+                    // data: 的内容就在 URL 里，直接解出来落盘
+                    val comma = url.indexOf(',')
+                    if (comma > 0) {
+                        val meta = url.substring(5, comma)
+                        val payload = url.substring(comma + 1)
+                        val type = meta.substringBefore(";").ifBlank { mimeType ?: "" }
+                        val bytes = if (meta.endsWith(";base64")) {
+                            android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+                        } else {
+                            Uri.decode(payload).toByteArray()
+                        }
+                        saveToDownloads(
+                            android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType),
+                            type,
+                            bytes,
+                        )
+                    }
+                    return@DownloadListener
+                }
+                if (url.startsWith("blob:")) {
+                    // blob 的内容只在页面内存里，DownloadManager 拿不到：
+                    // 让页面用 XHR 读出来、转 base64 交回来，再落盘
+                    val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
+                    val js = """
+                        (function(){
+                          var xhr = new XMLHttpRequest();
+                          xhr.open('GET', ${jsString(url)}, true);
+                          xhr.responseType = 'blob';
+                          xhr.onload = function(){
+                            var r = new FileReader();
+                            r.onloadend = function(){
+                              var s = r.result || '';
+                              var i = s.indexOf(',');
+                              AndroidShell.saveBase64(${jsString(fileName)}, ${jsString(mimeType ?: "")}, i >= 0 ? s.substring(i + 1) : '');
+                            };
+                            r.readAsDataURL(xhr.response);
+                          };
+                          xhr.onerror = function(){
+                            AndroidShell.saveBase64(${jsString(fileName)}, ${jsString(mimeType ?: "")}, '');
+                          };
+                          xhr.send();
+                        })();
+                    """.trimIndent()
+                    webView.evaluateJavascript(js, null)
                     Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
@@ -221,10 +264,55 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    /** 把字节写进公共「下载」目录 */
+    private fun saveToDownloads(name: String, mime: String, bytes: ByteArray) {
+        val safeName = name.ifBlank { "小手机导出_${System.currentTimeMillis()}" }
+        val type = mime.ifBlank { "application/octet-stream" }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, type)
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val resolver = contentResolver
+            val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("系统拒绝了写入请求")
+            resolver.openOutputStream(uri).use { it?.write(bytes) }
+            values.clear()
+            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+        } else {
+            @Suppress("DEPRECATION")
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists()) dir.mkdirs()
+            java.io.File(dir, safeName).writeBytes(bytes)
+        }
+        runOnUiThread { Toast.makeText(this, "已保存到「下载」：$safeName", Toast.LENGTH_LONG).show() }
+    }
+
+    /** 把字符串安全地塞进 JS */
+    private fun jsString(s: String): String =
+        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "") + "\""
+
     /** 暴露给网页的原生桥（网页侧可用 window.AndroidShell 特性检测壳环境）。 */
     inner class ShellBridge {
         @JavascriptInterface
         fun getVersion(): String = VERSION
+
+        /** 网页侧把 blob/data 的内容用 base64 传过来，这里真正落盘 */
+        @JavascriptInterface
+        fun saveBase64(name: String, mime: String, base64: String) {
+            if (base64.isEmpty()) {
+                runOnUiThread { Toast.makeText(this@MainActivity, "导出内容为空，保存失败", Toast.LENGTH_LONG).show() }
+                return
+            }
+            runCatching {
+                val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+                saveToDownloads(name, mime, bytes)
+            }.onFailure {
+                runOnUiThread { Toast.makeText(this@MainActivity, "保存失败：${it.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
